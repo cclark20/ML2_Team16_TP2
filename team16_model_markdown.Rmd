@@ -1,0 +1,177 @@
+---
+title: "ASHRAE - Great Energy Predictor III"
+author: "Team 16: Koby Arndt, Casey Clark, Nick Ohlheiser, and Sean Powell"
+date: "4/20/2021"
+output: 
+  html_document:
+  toc: true
+  toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+```
+
+## Introduction
+
+For the ASHRAE - Great Energy Predictor Kaggle competition, we built a lightgbm model to predict the energy usage of different buildings given building and weather information. This markdown will go through the code to load in data, train the model, and make predictions.
+
+In the first chunk, we will load in our necessary libraries and set a seed for consistent results. We will use data.table for efficient loading and transforming of large datasets. Fasttime is used for time parsing. Lightgbm contains the functions for training a light gradient boosting model. And lubridate is used for manipulating dates. 
+
+```{r, message=FALSE, warning=FALSE}
+library(data.table)
+library(fasttime)
+library(lightgbm)
+library(lubridate)
+
+set.seed(0)
+```
+
+## Data prep function
+
+This prep function will be used to load, merge, and prepare our training data. fread from data.table is used to quickly read in large csv files. Kaggle provided three different datasets that needed to be merged into one training set, which is done on lines 43 and 44 within the function. We create several new columns, containing information from the datetime of the observation. These columns are weekday, hour, and season. Since we have several categorical variables, we convert the columns containing text to factors, then to integers. We change the factors to integers because lightgbm expects categorical variables to be integer encoded. Finally, the data is sorted by timestamp.
+
+```{r def_function}
+#---------------------------
+# create function for loading and prepping data
+prep <- function(dt_fn, meta_fn, weather_fn, drops, sort_timestamp = FALSE, n_max = Inf){
+  cat("Loading data...\n") 
+  dt <- fread(dt_fn, nrows = n_max, verbose = FALSE) # using fread to read train data
+  weather <- fread(weather_fn, nrows = n_max, verbose = FALSE) # fread to read weather data
+  meta <- fread(meta_fn, nrows = n_max, verbose = FALSE) # fread to read metadata
+  
+  cat("Merging datasets...\n")
+  dt[meta, on = "building_id", names(meta) := mget(names(meta))] # add metadata to dt by 'building_id'
+  dt[weather, on = c("site_id", "timestamp"), names(weather) := mget(names(weather))] # add weather data to dt by site id and timestamp
+  
+  # remove meta and weather data, since it was merged into dt
+  rm(meta, weather)
+  # call garbage collection to prompt R to return memory usage to operating system
+  invisible(gc())  
+  
+  cat("Processing features...\n")
+  # drops are preselected columns that will be dropped from the model
+  # note: changing columns to NULL values is preferred, as it takes 0 time and achieves the same result as deleting
+  # fastPOSIXct easily converts string datetime into POSIXct objects
+  # after it's converted, we create weekday and hour columns
+  # create season column using lubridate's (quarter) starting at December
+  # this splits the timestamps into 4 sections (Dec/Jan/Feb - Mar/Apr/May - Jun/Jul/Aug - Sep/Oct/Nov)
+  # we also get the year built by subtracting 1900 in order to have two digit years
+  # We take the log1p of square feet
+  dt[, (drops) := NULL
+     ][, timestamp := fastPOSIXct(timestamp)
+       ][, `:=`(wday = wday(timestamp),
+                hour = hour(timestamp),
+                season = quarter(timestamp, with_year=FALSE, fiscal_start = 12),
+                year_built = year_built - 1900,
+                square_feet = log1p(square_feet))]
+
+  cat("Converting categorical columns...\n")
+  # if any subset of x's data is a character, convert to a factor, then to an integer.
+  # lightgbm requires integer encoded categorical features, so R factors will not work
+  dt[, names(dt) := lapply(.SD, function(x) {if (is.character(x)) x <- as.integer(as.factor(x)); x})]
+  
+  # sort the records by timestamp
+  if (sort_timestamp) setorder(dt, timestamp)
+  # remove timestamp column (remember we already split it into weekday, hour and year)
+  dt[, timestamp := NULL]
+}
+```
+
+## Data Preparation
+
+Next, we specify our categorical variable columns and the columns we wish to drop from the model. After this, we run our prep function, providing our three datasets, the columns we wish to drop, and specify TRUE, which will tell the function to sort by timestamp. We then save our y variable as the log(1+x) of meter reading and remove this column from the train data. Lastly, we convert the train data.table to a data.matrix for lightgbm. 
+
+```{r load_train}
+#  cats will be used in lightgbm to specify categorical variables
+cats <- c("meter", "primary_use", "hour", "wday", 'season')
+# columns that will not be used in training
+drops <- c("sea_level_pressure", "wind_direction", "wind_speed","building_id","site_id")
+# run prep function on our train data files and save to tr
+tr <- prep("train.csv",
+           "building_metadata.csv",
+           "weather_train.csv",
+           drops, TRUE)
+# inspect data
+str(tr)
+summary(tr)
+# take the log of meter reading and save as our y variable
+y <- log1p(tr$meter_reading)
+# remove meter reading from tr by making the column all NULL
+tr[, meter_reading := NULL]
+# convert tr to a data.matrix
+tr <- data.matrix(tr)
+```
+
+## Model Training
+
+In this section, we will define our lightgbm parameters and train our model. We will use 'gbdt' boosting for regression and will track rmse. Our training data will consist of 80% of the observations from the dataset and we will validate using the remaining 20%. To split the dataset, we use createDataPartition from the caret package to generate random indices. 
+
+For lightgbm, we prepare our train and validation datasets by subsetting our tr dataset using the indices from createDataPartition. This is also where we specify the integer encoded categorical variables. After this, we can train our lightgbm model using the predefined parameters, our 80% train data, 2000 rounds, our 20% validation daata, evaluation frequency of 200 and early stopping rounds of 200. After the model is trained, we can call the lgb.importance function to save and plot the importance of each feature.
+
+In the importance graph below, we see that square footage is the most important feature, followed by meter type, year built, primary use, and air temperature. This means that our model gained the most information for predicting energy usage by the size of the building. 
+
+```{r train}
+# define lightgbm parameters
+p <- list(boosting = "gbdt",
+          objective = "regression_l2",
+          metric = "rmse",
+          nthread = 4,
+          learning_rate = 0.05,
+          num_leaves = 40,
+          colsample_bytree = 0.85,
+          lambda = 2)
+
+N <- nrow(tr) # save the number of rows in tr
+divideData<- caret::createDataPartition(y, p=0.8, list=FALSE) # 80% train, 20% validation
+model<- list()
+imp <- data.table()
+
+# training once using 80% for train, 20% for val
+xtrain<- lgb.Dataset(tr[divideData, ], label=y[divideData],categorical_feature = cats)
+xval<- lgb.Dataset(tr[-divideData,], label=y[-divideData],categorical_feature = cats)
+model[[1]]<- lgb.train(p, xtrain, 2000, list(val=xval), eval_freq=200, early_stopping_rounds = 200)
+imp<- lgb.importance(model[[1]])
+rm(xtrain, xval)
+invisible(gc())
+
+# plot the importances from imp
+lgb.plot.importance(imp)
+
+# remove these variables from the environment
+rm(tr, y, imp, p, N, divideData)
+invisible(gc())
+```
+
+## Load Test data to make predictions
+
+Before we use our model to make predictions, we need to load and prepare our test data. The test dataset is considerably larger than the train data. It has over 42 million rows that we will make predictions on. To load and prepare, we will use the same prep function we used for the train data. 
+
+```{r load_test}
+cat("Preparing test data...\n")
+# use prep function on our test data, so we can make predictions
+te <- prep("test.csv",
+           "building_metadata.csv",
+           "weather_test.csv",
+           drops)
+invisible(gc())
+str(te)
+te <- as.matrix(te[, row_id := NULL])
+invisible(gc())
+```
+
+## Make Predictions
+
+The last step in this competition is making predictions on the test set using our trained lightgbm model. Kaggle expects a specificly formatted csv for submission, so we also generate that in this last code chunk. 
+
+```{r predict}
+pred_te <- sapply(model, function(m_lgb) expm1(predict(m_lgb, te)))
+invisible(gc())
+
+sub <- fread("sample_submission.csv")
+sub[, meter_reading := round(rowMeans(pred_te), 2)
+    ][meter_reading < 0, meter_reading := 0]
+head(sub)
+fwrite(sub, "submission2.csv")
+```
